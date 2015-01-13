@@ -1,0 +1,165 @@
+#!/usr/bin/env ruby
+#
+# Converts a very limited subset of Gerber as emitted by gEDA PCB to an OpenSCAD script.
+#
+# Gerber specification: http://www.ucamco.com/files/downloads/file/81/the_gerber_file_format_specification.pdf?b60f173eef803691c0c4865d72d7b03a
+#
+
+aperture_by_id = {}
+
+class Circle
+  def initialize diameter
+    @diameter = diameter
+  end
+  def to_scad
+    "circle( r= %.02f );"% (@diameter/2)
+  end
+end
+
+class Rect
+  def initialize width, height
+    @width = width
+    @height = height
+  end
+  def to_scad
+    "square([ #{@width}, #{@height} ], center=true );"
+  end
+end
+
+class Region
+  attr_reader :contour_points
+  def initialize
+    @contour_points = []
+  end
+end
+
+Point = Struct.new :x, :y
+
+
+def shit! message
+  raise StandardError.new  message
+end
+
+
+regions = []
+@selected_aperture = nil
+@x = nil  # Declare at this scope.  X and Y of command.  required global because sometimes X or Y is used from previous command
+@y = nil
+@region = nil  # non-nil when a region is being defined
+
+
+# In the context of the selected aperture and possibly while defining the
+# contour of a region..
+#
+def execute code
+  case code
+    when "D01" # Draw TO the co-ordinates
+      if @region
+        @region.contour_points << Point.new( @x, @y )
+      else
+        puts "  hull() {"
+        puts "    translate([ #{@fx}, #{@fy} ]) #{@selected_aperture.to_scad}"
+        puts "    translate([ #{@x}, #{@y} ]) #{@selected_aperture.to_scad}"
+        puts "  }"
+        @fx = @x
+        @fy = @y
+      end
+    when "D02" # Move to the co-ordinates
+      if @region
+        @region.contour_points << Point.new( @x, @y )
+      else
+        @fx = @x
+        @fy = @y
+      end
+    when "D03" # Flash at the co-ordinates ( an instance of an aperture rather than using one as a brush)
+      puts "translate([ #{@x}, #{@y} ]) #{@selected_aperture.to_scad}"
+    else
+      shit! "Unsupported code: #{code}"
+  end
+end
+
+def emit_polygon
+  puts "  polygon(["
+  @region.contour_points.each do |p|
+    puts "    [ %.02f, %.02f ],"% [ p.x, p.y ]
+  end
+  puts "  ]);"
+end
+
+puts <<"."
+linear_extrude( height= 0.2, convexity=2 )
+scale( 25.4/1000 ) // Convert from mils to mm
+{
+.
+$stdin.each_line do |line| line.chomp!
+  # %MOIN*%       MO:Mode IN:Inches
+  # %FSLAX25Y25*% Coordinates: Absolute, 2 integer digits, 5 fractional ( or 5 in total? FIXME)
+  # %LNTOP*%      LN:Level Name "TOP"
+  # %ADD17C,0.0400*%          AD:Aperture Define "D17" as C:Circle 40 mils diameter
+  # %ADD14R,0.0300X0.0300*%   R:Rectangle, 30x30 mils
+  # G54D11*G36*                       G54:Obsolete but select aperture D11, G36: Begin region
+  # X50000Y85988D02*X50628Y86037D01*  D02:end contour ( presumably to move to start of contour), D01: Draw segment of contour
+  # X51240Y86184D01*
+  # Y85828D01*                X ordinate may be absent
+  # G54D13*X50000Y20000D03*             G54:Obsolete select aperature (D13)  x,y,D03:Flash
+  # G54D14*X33760Y70650D02*Y68250D01*   Draw from WHERE?  D02:Move, D01:Draw to these co-ordinates
+  # X41240Y70650D02*Y68250D01*          Further draws with the same aperture
+  # G54D16*G54D17*M02*                  M02:EOF
+  case line
+    when /^G04 /
+      # This is a comment.  Ignored
+    when /^%(.+)\*%$/
+      case $1
+        when "MOIN"
+          # Inches.  Superb
+        when "FSLAX25Y25"
+          # gEDA PCB outputs this
+        when "LNTOP"
+          # That's nice.  We don't plan to use that
+        when /^ADD(\d+)([CR]),(.+)/
+          id, type, params = $1, $2, $3
+          aperture_by_id[ id] = case type
+            when "C"
+              Circle.new  params.to_f * 1000
+            when "R"
+              # params: 0.0300X0.0300
+              Rect.new *params.split("X").map{|v| v.to_f * 1000 }
+            else
+              shit! "Unsupported geometry type: #{line}"
+          end
+        else
+          shit! "Unrecognised: #{line}"
+      end
+    else
+      blocks = line.split "*"
+      blocks.each do |block|
+        case block
+          when /^G54D(\d+)$/ # Select aperture
+            @selected_aperture = aperture_by_id[ $1]
+            shit! "No such aperture: #{$1}" if @selected_aperture.nil?
+          when "G36"  # Begin region
+            @region = Region.new
+            regions << @region
+          when "G37"  # End region
+            emit_polygon
+            @region = nil
+          when /^X(\d+)Y(\d+)(D\d+)$/  # X, Y and code
+            @x, @y, code = $1.to_f / 100, $2.to_f / 100, $3
+            execute  code
+          when /^X(\d+)(D\d+)$/  # X and code
+            @x, code = $1.to_f / 100, $2
+            execute  code
+          when /^Y(\d+)(D\d+)$/  # X and code
+            @y, code = $1.to_f / 100, $2
+            execute  code
+          when "M02"  # End of file
+          else
+            shit! "Unrecognised: #{block}"
+        end
+      end
+  end
+end
+puts <<"."
+}
+.
+
