@@ -1,0 +1,93 @@
+#!/usr/bin/env ruby
+#
+# Converts a very limited subset of OpenStreetMap maps to OpenSCAD with the
+# intention of laser-cutting the islands isolated by the roads.
+#
+
+require "rubygems"
+require "nokogiri"
+
+
+# Distance across finished work in mm
+FINAL_SIZE = 50
+ROAD_WIDTH = 5 * 0.67
+
+ROAD_WITH_SCALE = {
+  "primary" => 1,
+  "secondary" => 0.8,
+  "tertiary" => 0.6,
+  "residential" => 0.4,
+}
+
+# EXAMPLE OF FORMAT:
+#<?xml version="1.0" encoding="UTF-8"?>
+#<osm version="0.6" generator="CGImap 0.0.2">
+# <bounds minlat="-43.8719800" minlon="172.9142300" maxlat="-43.8670600" maxlon="172.9227400"/>
+# <node id="1105541235" lat="-43.8737724" lon="172.9249314" user="LINZ Data Upload" uid="252775" visible="true" version="1" changeset="6983042" timestamp="2011-01-15T22:57:04Z"/>
+# <way id="95310139" user="LINZ Data Upload" uid="252775" visible="true" version="1" changeset="6983042" timestamp="2011-01-15T22:57:31Z">
+#  <nd ref="1105541416"/>
+#  <tag k="attribution" v="http://wiki.osm.org/wiki/Attribution#LINZ"/>
+# </way>
+#</osm>
+
+Point = Struct.new :latitude, :longitude
+
+PROLOGUE = <<"."
+
+$fa = 1; // Don't use circle segments smaller than 1mm
+$fn = 8; // Max circle segments is 8
+
+linear_extrude( height= 0.3 )
+{
+  difference()
+  {
+    square([ #{FINAL_SIZE}, #{FINAL_SIZE} ], center=true );
+    union()
+    {
+.
+
+EPILOGUE = <<"."
+    }
+  }
+}
+.
+
+puts PROLOGUE
+
+doc = Nokogiri::XML( $stdin.read) {|config| config.noblanks}
+# Work out the latitude and longitude at the center of the map
+bounds_element = doc % "bounds"
+minlat, maxlat, minlon, maxlon = %w|minlat maxlat minlon maxlon|.map {|k| bounds_element[k].to_f }
+width = maxlon - minlon
+height = maxlat - minlat
+scale = FINAL_SIZE / width
+center = Point.new( minlat + height / 2, minlon + width / 2 )
+# Build a map from <node> id to its latitude and longitude
+nodes_by_id = ( doc / "node").reduce({}) do |map, node_element|
+  id, lat, lon = %w|id lat lon|.map {|k| node_element[k]}
+  id, lat, lon = id.to_i, (lat.to_f - center.latitude) * scale, (lon.to_f - center.longitude) * scale
+  map[ id] = Point.new  lat, lon
+  map
+end
+# Go through each of the <way>s
+( doc / "way").each do |way_element|
+  # Only consider roads not buildings, park boundaries, etc.
+  highway_tag = ( way_element.at_css "tag[k=highway]")
+  road_type = highway_tag ? highway_tag[:v] : nil
+  next unless %w|primary secondary tertiary residential|.include? road_type
+  road_width = ROAD_WIDTH * ROAD_WITH_SCALE[ road_type] / 2
+  nodes = ( way_element / "nd").map {|nd_element| nodes_by_id[ nd_element[:ref].to_i] }
+  # Go through each section ( between two nodes that are part of the way)
+  nodes.each_with_index do |node, i|
+    # Ignore the first since we're only interested in segments ending at nodes
+    next if 0 == i
+    prev = nodes[ i - 1]
+    puts "  hull() {"
+    puts "    translate([ %05f, %05f ]) circle( r=%01f);"% [ prev.longitude, prev.latitude, road_width ]
+    puts "    translate([ %05f, %05f ]) circle( r=%01f );"% [ node.longitude, node.latitude, road_width ]
+    puts "  }"
+  end
+end
+
+puts EPILOGUE
+
