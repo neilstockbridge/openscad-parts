@@ -4,6 +4,27 @@
 #
 # Gerber specification: http://www.ucamco.com/files/downloads/file/81/the_gerber_file_format_specification.pdf?b60f173eef803691c0c4865d72d7b03a
 #
+# Use:
+#
+#   flip=y  w=750  h=800  gbr2scad </tmp/example.bottom.gbr  >/tmp/example.scad
+#
+
+
+PROLOGUE = <<"."
+linear_extrude( height= 0.2, convexity=2 )
+scale( 25.4/1000 ) // Convert from mils to mm
+scale([ #{ ENV["flip"] == "y" ? -1 : 1 }, 1 ])
+difference() // So that the outline is cut
+{
+  square([ #{ ENV["w"] }, #{ ENV["h"] } ]);
+  union()
+  {
+.
+
+EPILOGUE = <<"."
+  }
+}
+.
 
 aperture_by_id = {}
 
@@ -86,11 +107,8 @@ def emit_polygon
   puts "  ]);"
 end
 
-puts <<"."
-linear_extrude( height= 0.2, convexity=2 )
-scale( 25.4/1000 ) // Convert from mils to mm
-{
-.
+puts PROLOGUE
+
 $stdin.each_line do |line| line.chomp!
   # %MOIN*%       MO:Mode IN:Inches
   # %FSLAX25Y25*% Coordinates: Absolute, 2 integer digits, 5 fractional ( or 5 in total? FIXME)
@@ -159,7 +177,5 @@ $stdin.each_line do |line| line.chomp!
       end
   end
 end
-puts <<"."
-}
-.
+puts EPILOGUE
 
