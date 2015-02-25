@@ -114,7 +114,7 @@ $stdin.each_line do |line| line.chomp!
           # Inches.  Superb
         when "FSLAX25Y25"
           # gEDA PCB outputs this
-        when "LNTOP"
+        when /^LN\w+/
           # That's nice.  We don't plan to use that
         when /^ADD(\d+)([CR]),(.+)/
           id, type, params = $1, $2, $3
