@@ -29,6 +29,7 @@ EPILOGUE = <<"."
 aperture_by_id = {}
 
 class Circle
+  attr_reader :diameter
   def initialize diameter
     @diameter = diameter
   end
@@ -51,6 +52,28 @@ class Region
   attr_reader :contour_points
   def initialize
     @contour_points = []
+  end
+end
+
+class Vector
+
+  attr_reader :dx, :dy
+
+  def initialize dx, dy
+    @dx = dx
+    @dy = dy
+  end
+
+  def + that
+    Vector.new @dx + that.dx, @dy + that.dy
+  end
+
+  def bearing
+    if @dy == 0.0
+      @dx < 0 ? -Math::PI/2 : Math::PI/2
+    else
+      Math.atan2 @dx, @dy  # Note x passed as y
+    end
   end
 end
 
@@ -122,6 +145,8 @@ $stdin.each_line do |line| line.chomp!
   # G54D13*X50000Y20000D03*             G54:Obsolete select aperature (D13)  x,y,D03:Flash
   # G54D14*X33760Y70650D02*Y68250D01*   Draw from WHERE?  D02:Move, D01:Draw to these co-ordinates
   # X41240Y70650D02*Y68250D01*          Further draws with the same aperture
+  # X145800D02*G75*G03X154200Y203200I4200J0D01*G01*   Arc then interpolate a..
+  # Y206800D02*G75*G03X145800Y206800I-4200J0D01*G01*  ..line then another arc
   # G54D16*G54D17*M02*                  M02:EOF
   case line
     when /^G04 /
@@ -161,15 +186,68 @@ $stdin.each_line do |line| line.chomp!
           when "G37"  # End region
             emit_polygon
             @region = nil
-          when /^X(\d+)Y(\d+)(D\d+)$/  # X, Y and code
+          when /^X(-?\d+)Y(-?\d+)(D\d+)$/  # X, Y and code
             @x, @y, code = $1.to_f / 100, $2.to_f / 100, $3
             execute  code
-          when /^X(\d+)(D\d+)$/  # X and code
+          when /^X(-?\d+)(D\d+)$/  # X and code
             @x, code = $1.to_f / 100, $2
             execute  code
-          when /^Y(\d+)(D\d+)$/  # X and code
+          when /^Y(-?\d+)(D\d+)$/  # X and code
             @y, code = $1.to_f / 100, $2
             execute  code
+          when "G75"  # Set multi-quadrant mode for the following arcs
+          when "G01"  # Linear interpolate ( draw a straight line)
+          when /^G03X(-?\d+)Y(-?\d+)I(-?\d+)J(-?\d+)D(\d+)$/  # Counter-clockwise arc to X,Y with center at I,J ( relative to current)
+            @x, @y, @i, @j, code = $1.to_f/100, $2.to_f/100, $3.to_f/100, $4.to_f/100, $5
+            shit! "Unexpected code: #{ code }" if code != "01"
+            shit! "Expected a circular aperture" unless @selected_aperture.is_a? Circle
+            cx = @fx + @i
+            cy = @fy + @j
+            r = Math.sqrt( @i*@i + @j*@j )
+            inner = r - @selected_aperture.diameter / 2
+            outer = r + @selected_aperture.diameter / 2
+            # Work out the vector from the center to a) the current position, and b) the next position
+            to_current = Vector.new  @i != 0.0 ? -@i : 0, -@j # Avoid negative 0 or atan2 gets upset
+            to_next = to_current + Vector.new( @x - @fx, @y - @fy)
+            from_angle = to_current.bearing
+            to_angle = to_next.bearing
+            mid_angle = from_angle - ( to_angle - from_angle).abs / 2
+            from_x = Math.sin(from_angle) * r * 2
+            from_y = Math.cos(from_angle) * r * 2
+            mid_x = Math.sin(mid_angle) * r * 2
+            mid_y = Math.cos(mid_angle) * r * 2
+            to_x = Math.sin(to_angle) * r * 2
+            to_y = Math.cos(to_angle) * r * 2
+            #p @fx, @fy, @x, @y, @i, @j, Vector.new( @x - @fx, @y - @fy), to_current, to_next, from_angle, mid_angle, to_angle
+            # Full circles don't need an arc so don't need an intersection()
+            ring = <<"            ."% [ outer, inner ]
+              difference() {
+                circle( r= %.02f );
+                circle( r= %.02f );
+              }
+            .
+            slice = <<"            ."% [ from_x, from_y, mid_x, mid_y, to_x, to_y ]
+              polygon([
+                [ 0, 0 ],
+                [ %.02f, %.02f ],
+                [ %.02f, %.02f ],
+                [ %.02f, %.02f ],
+              ]);
+            .
+            if from_angle == to_angle
+              core = ring
+            else
+              core = <<"              ."
+              intersection() {
+                #{ ring }
+                #{ slice }
+              }
+              .
+            end
+            puts <<"            ."
+            translate([ #{cx}, #{cy} ])
+              #{ core }
+            .
           when "M02"  # End of file
           else
             shit! "Unrecognised: #{block}"
