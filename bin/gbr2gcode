@@ -1,0 +1,419 @@
+#!/usr/bin/env ruby
+#
+# Converts a very limited subset of Gerber as emitted by gEDA PCB to G-code for
+# driving a laser etching machine ( for silk screen)
+#
+# Gerber specification:
+#   http://www.ucamco.com/files/downloads/file/81/the_gerber_file_format_specification.pdf
+#
+# Use:
+#
+#   gbr2gcode </tmp/example.topsilk.gbr  >/tmp/example.gcode
+#
+# This code is ugly in places but needs to be under revision control.
+#
+
+RETRACT_HEIGHT = 3
+#RETRACT_HEIGHT = 8
+PLOT_HEIGHT = 1.7
+#PLOT_HEIGHT = 5.3
+
+
+def shit! message
+  raise StandardError.new  message
+end
+
+
+aperture_by_id = {}
+
+
+class Array
+
+  def first_where
+    self.each do |element|
+      return element if yield element
+    end
+    return nil
+  end
+
+end
+
+
+class Float
+
+  def to_gcode
+    "%.03f"% ( self / 1000 * 25.4)
+  end
+
+end
+
+
+class Circle
+  attr_reader :diameter
+
+  def initialize diameter
+    @diameter = diameter
+  end
+
+  def radius
+    @diameter / 2
+  end
+end
+
+
+class Rect
+
+  attr_reader :width, :height
+
+  def initialize width, height
+    @width = width
+    @height = height
+  end
+end
+
+
+class Region
+  attr_reader :contour_points
+  def initialize
+    @contour_points = []
+  end
+end
+
+
+class Vector
+
+  attr_reader :x, :y
+
+  def initialize x, y
+    @x = x
+    @y = y
+  end
+
+  def set_to! that
+    @x = that.x
+    @y = that.y
+  end
+
+  def + that
+    Vector.new @x + that.x, @y + that.y
+  end
+
+  def - that
+    Vector.new @x - that.x, @y - that.y
+  end
+
+  def * coefficient
+    Vector.new @x * coefficient, @y * coefficient
+  end
+
+  def / divisor
+    Vector.new @x / divisor, @y / divisor
+  end
+
+  def magnitude
+    Math.sqrt( @x*@x + @y*@y )
+  end
+
+  def bearing
+    if @y == 0.0
+      @x < 0 ? -Math::PI/2 : Math::PI/2
+    else
+      Math.atan2 @x, @y  # Note x passed as y
+    end
+  end
+
+  def to_s
+    "#{@x}, #{@y}"
+  end
+
+  def to_gcode
+    "X#{@x.to_gcode} Y#{@y.to_gcode}"
+  end
+end
+
+
+class Stroke
+
+  @@all = []
+  @@ending_at = {}
+
+  class << self
+
+    def all
+      @@all
+    end
+
+    def ending_at
+      @@ending_at
+    end
+
+  end # of class methods
+
+  attr_reader :where_begins, :where_ends
+  attr_accessor :next
+
+  def initialize where_begins, where_ends
+    # NOTE: @current_position is passed as where_begins, which is updated
+    # rather than replace, so all Strokes will end up referring to the same
+    # Vector unless dup'd!
+    @where_begins = where_begins.dup
+    @where_ends = where_ends
+    @@all.push self
+    (@@ending_at[@where_ends.to_s] ||= []).push self
+  end
+
+  def reverse!
+    @@ending_at[@where_ends.to_s].delete self
+    remember = @where_begins
+    @where_begins = @where_ends
+    @where_ends = remember
+    (@@ending_at[@where_ends.to_s] ||= []).push self
+  end
+end
+
+
+class Line < Stroke
+
+  def to_gcode
+    "G0 #{@where_ends.to_gcode}\t\t; Line to #{@where_ends.x},#{@where_ends.y}"
+  end
+
+  def put_laser_gcode
+    puts "G0 #{@where_begins.to_gcode}\t\t; Line from #{@where_begins.x},#{@where_begins.y} to #{@where_ends.x},#{@where_ends.y}"
+    puts "M100 P100\t\t; Laser ON"
+    puts "G1 #{@where_ends.to_gcode}"
+    puts "M100 P0\t\t; Laser OFF"
+  end
+end
+
+
+class Arc < Stroke
+  attr_reader :center
+
+  def initialize where_begins, where_ends, center
+    super  where_begins, where_ends
+    @center = center
+  end
+
+  def to_gcode
+    "G3 #{@where_ends.to_gcode} I#{@center.x.to_gcode} J#{@center.y.to_gcode}\t\t; Arc to #{@where_ends.x},#{@where_ends.y}"
+  end
+
+  def put_laser_gcode
+    puts "G0 #{@where_begins.to_gcode}\t\t; Arc from #{@where_begins.x},#{@where_begins.y} to #{@where_ends.x},#{@where_ends.y}"
+    puts "M100 P100\t\t; Laser ON"
+    puts "G3 #{@where_ends.to_gcode} I#{@center.x.to_gcode} J#{@center.y.to_gcode}"
+    puts "M100 P0\t\t; Laser OFF"
+  end
+end
+
+
+regions = []
+@selected_aperture = nil
+@region = nil  # non-nil when a region is being defined
+@current_position = Vector.new  0.0, 0.0
+
+
+# In the context of the selected aperture and possibly while defining the
+# contour of a region..
+#
+def execute code, new_position
+  case code
+    when "D01" # Draw TO the co-ordinates
+      if @region
+        @region.contour_points << new_position
+      else
+        Line.new( @current_position, new_position)
+        @current_position.set_to! new_position
+      end
+    when "D02" # Move to the co-ordinates
+      if @region
+        @region.contour_points << new_position
+      else
+        @current_position.set_to! new_position
+      end
+    when "D03" # Flash at the co-ordinates ( an instance of an aperture rather than using one as a brush)
+      puts "translate(#{new_position.to_scad}) #{@selected_aperture.to_scad}"
+    else
+      shit! "Unsupported code: #{code}"
+  end
+end
+
+n = lambda do |value|
+  value.to_f / 100
+end
+
+
+# Don't do this, but be sure to do it prior
+#G92 X0 Y0 ; Consider the current position ( positioned over the hole on the left with the lowest Y by the user) as the origin
+#G0 Z#{RETRACT_HEIGHT} F9999  # Not for a laser cutter
+puts <<"."
+G90 ; Absolute ordinates
+G21 ; Units are mm
+.
+
+$stdin.each_line do |line| line.chomp!
+  # %MOIN*%       MO:Mode IN:Inches
+  # %FSLAX25Y25*% Coordinates: Absolute, 2 integer digits, 5 fractional ( or 5 in total? FIXME)
+  # %LNTOP*%      LN:Level Name "TOP"
+  # %ADD17C,0.0400*%          AD:Aperture Define "D17" as C:Circle 40 mils diameter
+  # %ADD14R,0.0300X0.0300*%   R:Rectangle, 30x30 mils
+  # G54D11*G36*                       G54:Obsolete but select aperture D11, G36: Begin region
+  # X50000Y85988D02*X50628Y86037D01*  D02:end contour ( presumably to move to start of contour), D01: Draw segment of contour
+  # X51240Y86184D01*
+  # Y85828D01*                X ordinate may be absent
+  # G54D13*X50000Y20000D03*             G54:Obsolete select aperature (D13)  x,y,D03:Flash
+  # G54D14*X33760Y70650D02*Y68250D01*   Draw from WHERE?  D02:Move, D01:Draw to these co-ordinates
+  # X41240Y70650D02*Y68250D01*          Further draws with the same aperture
+  # X145800D02*G75*G03X154200Y203200I4200J0D01*G01*   Arc then interpolate a..
+  # Y206800D02*G75*G03X145800Y206800I-4200J0D01*G01*  ..line then another arc
+  # G54D16*G54D17*M02*                  M02:EOF
+  case line
+    when /^G04 /
+      # This is a comment.  Ignored
+    when /^%(.+)\*%$/
+      case $1
+        when "MOIN"
+          # Inches.  Superb
+        when "FSLAX25Y25"
+          # gEDA PCB outputs this
+        when /^LN\w+/
+          # That's nice.  We don't plan to use that
+        when /^ADD(\d+)([CR]),(.+)/
+          id, type, params = $1, $2, $3
+          aperture_by_id[ id] = case type
+            when "C"
+              Circle.new  params.to_f * 1000 # Convert from inches to mils
+            when "R"
+              # params: 0.0300X0.0300
+              Rect.new *params.split("X").map{|v| v.to_f * 1000 } # Converts from inches to mils
+            else
+              shit! "Unsupported geometry type: #{line}"
+          end
+        else
+          shit! "Unrecognised: #{line}"
+      end
+    else
+      blocks = line.split "*"
+      blocks.each do |block|
+        case block
+          when /^G54D(\d+)$/ # Select aperture
+            @selected_aperture = aperture_by_id[ $1]
+            shit! "No such aperture: #{$1}" if @selected_aperture.nil?
+          when "G36"  # Begin region
+            @region = Region.new
+            regions << @region
+          when "G37"  # End region
+            @region = nil
+          when /^X(-?\d+)Y(-?\d+)(D\d+)$/  # X, Y and code
+            x, y, code = n[$1], n[$2], $3
+            execute  code, Vector.new( x, y)
+          when /^X(-?\d+)(D\d+)$/  # X and code
+            x, code = n[$1], $2
+            execute  code, Vector.new( x, @current_position.y)
+          when /^Y(-?\d+)(D\d+)$/  # X and code
+            y, code = n[$1], $2
+            execute  code, Vector.new( @current_position.x, y)
+          when "G75"  # Set multi-quadrant mode for the following arcs
+          when "G01"  # Linear interpolate ( draw a straight line)
+          when /^G03X(-?\d+)Y(-?\d+)I(-?\d+)J(-?\d+)D(\d+)$/  # Counter-clockwise arc to X,Y with center at I,J ( relative to current)
+            x, y, i, j, code = n[$1], n[$2], n[$3], n[$4], $5
+            new_position = Vector.new  x, y
+            shit! "Unexpected code: #{ code }" if code != "01"
+            shit! "Expected a circular aperture" unless @selected_aperture.is_a? Circle
+            center = Vector.new  i, j
+            Arc.new(@current_position, new_position, center)
+            @current_position.set_to! new_position
+          when "M02"  # End of file
+          else
+            shit! "Unrecognised: #{block}"
+        end
+      end
+  end
+end
+
+
+# Group strokes according to connectedness, i.e. if a stroke begins or ends at
+# the beginning OR end of ANY stroke within an existing group then it belongs
+# in that group
+
+# This would be nice but would be hard work.  Instead, choose the stroke next
+# that is closest to the one just drawn
+
+strokes = Stroke.all
+@tool_position = strokes.first.where_begins
+while 0 < strokes.count
+  # Find the stroke closest to the tool position
+  closest = nil
+  distance_to_closest_so_far = nil
+  strokes.each do |candidate|
+    distance = (candidate.where_begins - @tool_position).magnitude
+    if distance_to_closest_so_far.nil? or distance < distance_to_closest_so_far
+      distance_to_closest_so_far = distance
+      closest = candidate
+    end
+  end
+  closest.put_laser_gcode
+  @tool_position = closest.where_ends
+  strokes.delete  closest
+end
+
+
+#FIXME: There are many line segments that could be joined in to a single line
+
+if false
+
+  strokes_that_begin_paths = Stroke.all.dup
+
+  # Go through the list of strokes
+  Stroke.all.each do |stroke|
+    # If another strokes ends at the place where this stroke begins then attach
+    # this stroke to that one as the stroke to draw afterwards
+    attempt = lambda do
+      possible_prior_strokes = Stroke.ending_at[ stroke.where_begins.to_s ]
+      if possible_prior_strokes
+        prior_stroke = possible_prior_strokes.first_where {|s| s.next.nil? }
+        if prior_stroke and prior_stroke != stroke
+          prior_stroke.next = stroke
+          strokes_that_begin_paths.delete  stroke
+          true
+        else
+          false
+        end
+      else
+        false
+      end
+    end
+    if ! attempt[] and stroke.next.nil?
+      # Consider reversing the direction of the line to see if a prior stroke can be found then
+      stroke.reverse! # TODO: Remove this line from Stroke.ending_at
+      if ! attempt[]
+        stroke.reverse!
+      end
+    end
+  end
+
+  # Would like list of strokes that begin paths
+  #puts Stroke.all.count
+  #puts Stroke.ending_at.count
+  #puts strokes_that_begin_paths.count
+
+  strokes_that_begin_paths.each do |stroke|
+    puts "G0 #{stroke.where_begins.to_gcode}"
+    puts "G1 Z#{PLOT_HEIGHT}"
+    dump = lambda do |s|
+      puts s.to_gcode
+      dump[ s.next] if s.next
+    end
+    dump[ stroke]
+    puts "G0 Z#{RETRACT_HEIGHT}"
+  end
+
+  #require 'yaml'
+  #puts Stroke.ending_at.to_yaml
+end
+
+puts <<"."
+M2  ; End program
+.
+
